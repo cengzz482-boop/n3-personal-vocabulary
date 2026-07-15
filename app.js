@@ -1,4 +1,5 @@
 const PAGE_SIZE = 30;
+const STANDALONE_DATA_VERSION = "20260715-2";
 const storageKey = "n3-personal-state-v1";
 const defaultSettings = {
   speed: 0.7, sentenceLevel: "N3", autoPronounce: true, personFirst: true, chineseAuto: false,
@@ -28,6 +29,9 @@ const sentenceCaptionCn = sentenceCaption.querySelector(".sentence-caption-cn");
 
 let words = [];
 let relatedLexicon = {};
+const standaloneScriptPromises = new Map();
+let detailDataPromise = null;
+let edgeChineseAudioPromise = null;
 let currentView = "home";
 let currentPage = 1;
 let studyIndex = 0;
@@ -96,6 +100,63 @@ state.settings = { ...defaultSettings, ...state.settings };
 state.brainwash = { sentence: false, wordSpeed: 1, sentenceSpeed: 1, count: 10, ...state.brainwash };
 autoReadDelay = state.settings.autoReadDelay;
 applyTheme();
+
+function loadStandaloneScript(filename, globalName) {
+  if (!window.__STANDALONE__ || window[globalName]) return Promise.resolve(window[globalName]);
+  if (standaloneScriptPromises.has(filename)) return standaloneScriptPromises.get(filename);
+
+  const promise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.async = true;
+    script.dataset.lazyStandalone = filename;
+    script.src = new URL(`${filename}?v=${STANDALONE_DATA_VERSION}`, document.baseURI).href;
+    script.onload = () => {
+      if (window[globalName]) resolve(window[globalName]);
+      else reject(new Error(`${filename} 内容无效`));
+    };
+    script.onerror = () => reject(new Error(`${filename} 下载失败，请检查网络后重试`));
+    document.head.appendChild(script);
+  }).catch(error => {
+    standaloneScriptPromises.delete(filename);
+    document.querySelector(`script[data-lazy-standalone="${filename}"]`)?.remove();
+    throw error;
+  });
+
+  standaloneScriptPromises.set(filename, promise);
+  return promise;
+}
+
+function ensureDetailData() {
+  if (!window.__STANDALONE__) return Promise.resolve();
+  if (window.__DETAILS__ && window.__SENTENCES__ && window.__RELATED_LEXICON__) {
+    relatedLexicon = window.__RELATED_LEXICON__;
+    return Promise.resolve();
+  }
+  if (detailDataPromise) return detailDataPromise;
+
+  detailDataPromise = Promise.all([
+    loadStandaloneScript("details.js", "__DETAILS__"),
+    loadStandaloneScript("sentences.js", "__SENTENCES__").catch(() => { window.__SENTENCES__ ||= {}; }),
+    loadStandaloneScript("related-lexicon.js", "__RELATED_LEXICON__").catch(() => { window.__RELATED_LEXICON__ ||= {}; }),
+  ]).then(() => {
+    relatedLexicon = window.__RELATED_LEXICON__ || {};
+  }).catch(error => {
+    detailDataPromise = null;
+    throw error;
+  });
+  return detailDataPromise;
+}
+
+function ensureEdgeChineseAudio() {
+  if (!window.__STANDALONE__ || window.__EDGE_CN_AUDIO__) return Promise.resolve(window.__EDGE_CN_AUDIO__);
+  if (!edgeChineseAudioPromise) {
+    edgeChineseAudioPromise = loadStandaloneScript("edge-audio.js", "__EDGE_CN_AUDIO__").catch(error => {
+      edgeChineseAudioPromise = null;
+      throw error;
+    });
+  }
+  return edgeChineseAudioPromise;
+}
 
 function loadState() {
   try {
@@ -670,12 +731,14 @@ function chineseAudio(word) {
   return `https://shiri.cdn.jingqueyun.com/cn_words/${word.audio_id}.mp3`;
 }
 
+function needsBundledChineseAudio(word) {
+  const audioId = String(word.audio_id || "");
+  return !audioId || audioId.includes("/") || audioId.includes("_") || String(word.is_generate_cn) === "0";
+}
+
 function bundledEdgeChineseAudio(word) {
   if (window.__STANDALONE__) return window.__EDGE_CN_AUDIO__?.[word.id] || "";
-  const audioId = String(word.audio_id || "");
-  return (!audioId || audioId.includes("/") || audioId.includes("_") || String(word.is_generate_cn) === "0")
-    ? `/local-data/edge-cn/${word.id}.mp3`
-    : "";
+  return needsBundledChineseAudio(word) ? `/local-data/edge-cn/${word.id}.mp3` : "";
 }
 
 function chineseSpeechText(word) {
@@ -822,15 +885,22 @@ function chineseSequenceItem(word) {
   const fallbackText = chineseSpeechText(word);
   const bundledAudio = bundledEdgeChineseAudio(word);
   if (bundledAudio) return { url: bundledAudio, rate: 1, fallbackText, lang: "zh-CN" };
-  const invalidCdnId = !word.audio_id || String(word.audio_id).includes("/") || String(word.audio_id).includes("_") || String(word.is_generate_cn) === "0";
-  return invalidCdnId
+  return needsBundledChineseAudio(word)
     ? { speechText: fallbackText, lang: "zh-CN" }
     : { url: chineseAudio(word), rate: 1, fallbackText, lang: "zh-CN" };
 }
 
-function playChineseMeaning(word) {
+async function playChineseMeaning(word) {
   pauseAutoRead();
   mascotReact("cheer");
+  if (window.__STANDALONE__ && needsBundledChineseAudio(word) && !window.__EDGE_CN_AUDIO__) {
+    showNotice("首次使用这类中文发音，正在准备音频...");
+    try {
+      await ensureEdgeChineseAudio();
+    } catch {
+      showNotice("内置中文音频加载失败，已改用浏览器语音");
+    }
+  }
   playSequence([chineseSequenceItem(word)]);
 }
 
@@ -1761,6 +1831,7 @@ async function showDetail(word, options = {}) {
   try {
     let data;
     let levelSentences = {};
+    if (window.__STANDALONE__) await ensureDetailData();
     if (window.__DETAILS__) {
       data = window.__DETAILS__[word.id];
       if (!data) throw new Error("未找到词条详情");
@@ -2150,10 +2221,21 @@ async function openPetTool(type) {
   }
   const word = currentDetailWord || words[Math.floor(Math.random() * words.length)];
   let data = currentDetailData && currentDetailWord?.id === word.id ? currentDetailData : getDetail(word);
+  if (!data && window.__STANDALONE__) {
+    showNotice("首次使用学习工具，正在准备词条详情...");
+    try {
+      await ensureDetailData();
+      data = getDisplayDetail(word);
+    } catch (error) {
+      showNotice(error.message || "词条详情加载失败");
+      return;
+    }
+  }
   if (!data && !window.__DETAILS__) {
     const response = await fetch(`/local-data/details/${word.id}.json`);
     data = await response.json();
   }
+  if (!data) return showNotice("未找到这个单词的详情");
   if (type === "spell") openSpellTool(word, data);
   if (type === "brainwash") openBrainwashTool(word, data);
 }
@@ -2422,13 +2504,10 @@ reducedMotionQuery.addEventListener?.("change", event => {
   } else if (mascotAwake && state.settings.petEnabled) scheduleMascotBehavior(5000);
 });
 
-Promise.all([
-  Promise.resolve(window.__WORDS__ || fetch("/api/words").then(response => response.json())),
-  Promise.resolve(window.__RELATED_LEXICON__ || fetch("/local-data/related-lexicon.json?v=2").then(response => response.ok ? response.json() : {}).catch(() => ({}))),
-])
-  .then(([wordData, relatedWordData]) => {
+Promise.resolve(window.__WORDS__ || fetch("/api/words").then(response => response.json()))
+  .then(wordData => {
     words = wordData;
-    relatedLexicon = relatedWordData;
+    relatedLexicon = window.__RELATED_LEXICON__ || {};
     assignLessons();
     navigate("home");
     scheduleMotionWarmup();
