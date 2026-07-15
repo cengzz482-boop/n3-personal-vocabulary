@@ -1,5 +1,6 @@
 const PAGE_SIZE = 30;
-const STANDALONE_DATA_VERSION = "20260715-3";
+const STANDALONE_DATA_VERSION = "20260715-4";
+const DETAIL_CHUNK_COUNT = 64;
 const storageKey = "n3-personal-state-v1";
 const defaultSettings = {
   speed: 0.7, sentenceLevel: "N3", autoPronounce: true, personFirst: true, chineseAuto: false,
@@ -30,7 +31,7 @@ const sentenceCaptionCn = sentenceCaption.querySelector(".sentence-caption-cn");
 let words = [];
 let relatedLexicon = {};
 const standaloneScriptPromises = new Map();
-let detailDataPromise = null;
+const detailChunkPromises = new Map();
 let edgeChineseAudioPromise = null;
 let wordExtrasPromise = null;
 let wordExtrasHydrated = false;
@@ -128,25 +129,50 @@ function loadStandaloneScript(filename, globalName) {
   return promise;
 }
 
-function ensureDetailData() {
-  if (!window.__STANDALONE__) return Promise.resolve();
-  if (window.__DETAILS__ && window.__SENTENCES__ && window.__RELATED_LEXICON__) {
-    relatedLexicon = window.__RELATED_LEXICON__;
-    return Promise.resolve();
-  }
-  if (detailDataPromise) return detailDataPromise;
+function detailChunkId(word) {
+  const numericId = Number(word?.id);
+  if (Number.isFinite(numericId)) return ((numericId % DETAIL_CHUNK_COUNT) + DETAIL_CHUNK_COUNT) % DETAIL_CHUNK_COUNT;
+  let hash = 0;
+  for (const char of String(word?.id || "")) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return hash % DETAIL_CHUNK_COUNT;
+}
 
-  detailDataPromise = Promise.all([
-    loadStandaloneScript("details.js", "__DETAILS__"),
-    loadStandaloneScript("sentences.js", "__SENTENCES__").catch(() => { window.__SENTENCES__ ||= {}; }),
-    loadStandaloneScript("related-lexicon.js", "__RELATED_LEXICON__").catch(() => { window.__RELATED_LEXICON__ ||= {}; }),
-  ]).then(() => {
-    relatedLexicon = window.__RELATED_LEXICON__ || {};
+function hydrateDetailChunk(chunkId) {
+  const chunk = window.__DETAIL_CHUNKS__?.[chunkId];
+  if (!chunk) return false;
+  window.__DETAILS__ ||= {};
+  window.__SENTENCES__ ||= {};
+  Object.assign(window.__DETAILS__, chunk.details || {});
+  Object.assign(window.__SENTENCES__, chunk.sentences || {});
+  Object.assign(relatedLexicon, chunk.related || {});
+  return true;
+}
+
+function ensureDetailData(word) {
+  if (!window.__STANDALONE__ || window.__DETAILS__?.[word.id]) return Promise.resolve();
+  const chunkId = detailChunkId(word);
+  if (hydrateDetailChunk(chunkId)) return Promise.resolve();
+  if (detailChunkPromises.has(chunkId)) return detailChunkPromises.get(chunkId);
+
+  const filename = `detail-chunks/chunk-${String(chunkId).padStart(2, "0")}.js`;
+  const promise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.async = true;
+    script.dataset.detailChunk = String(chunkId);
+    script.src = new URL(`${filename}?v=${STANDALONE_DATA_VERSION}`, document.baseURI).href;
+    script.onload = () => hydrateDetailChunk(chunkId)
+      ? resolve()
+      : reject(new Error("详情分片内容无效"));
+    script.onerror = () => reject(new Error("详情下载失败，请检查网络后重试"));
+    document.head.appendChild(script);
   }).catch(error => {
-    detailDataPromise = null;
+    detailChunkPromises.delete(chunkId);
+    document.querySelector(`script[data-detail-chunk="${chunkId}"]`)?.remove();
     throw error;
   });
-  return detailDataPromise;
+
+  detailChunkPromises.set(chunkId, promise);
+  return promise;
 }
 
 function ensureEdgeChineseAudio() {
@@ -1869,11 +1895,16 @@ async function showDetail(word, options = {}) {
   notePetInteraction();
   resetDialogScroll();
   if (!dialog.open) dialog.show();
-  detailContent.innerHTML = '<div class="loading">正在读取本地词条详情...</div>';
+  detailContent.innerHTML = `
+    <div class="detail-summary">
+      <div class="detail-head"><h2>${escapeHtml(word.jp_word)} <span class="pitch">${escapeHtml(word.yindiao)}</span></h2><p>${escapeHtml(word.hiragana)} · ${escapeHtml(word.cixing)}</p>${state.settings.showRomaji ? `<small class="romaji">${escapeHtml(romaji(word.hiragana))}</small>` : ""}</div>
+      <div class="detail-meaning"><b>${escapeHtml(word.zh_word)}</b></div>
+    </div>
+    <div class="loading">正在加载完整释义与例句...</div>`;
   try {
     let data;
     let levelSentences = {};
-    if (window.__STANDALONE__) await ensureDetailData();
+    if (window.__STANDALONE__) await ensureDetailData(word);
     if (window.__DETAILS__) {
       data = window.__DETAILS__[word.id];
       if (!data) throw new Error("未找到词条详情");
@@ -1947,7 +1978,14 @@ async function showDetail(word, options = {}) {
     if (mascotAwake && !marioPet.classList.contains("pet-awakening")) mascotReact("jump");
     return displayData;
   } catch (error) {
-    detailContent.innerHTML = `<div class="empty error">${escapeHtml(error.message)}</div>`;
+    const loading = detailContent.querySelector(".loading");
+    const errorMarkup = `<div class="empty error">${escapeHtml(error.message)}<br><button class="ghost" data-detail-retry>重新加载</button></div>`;
+    if (loading) loading.outerHTML = errorMarkup;
+    else detailContent.insertAdjacentHTML("beforeend", errorMarkup);
+    detailContent.querySelector("[data-detail-retry]").onclick = () => {
+      openDetailWordId = "";
+      showDetail(word, options);
+    };
   }
 }
 
@@ -2267,7 +2305,7 @@ async function openPetTool(type) {
   if (!data && window.__STANDALONE__) {
     showNotice("首次使用学习工具，正在准备词条详情...");
     try {
-      await ensureDetailData();
+      await ensureDetailData(word);
       data = getDisplayDetail(word);
     } catch (error) {
       showNotice(error.message || "词条详情加载失败");
