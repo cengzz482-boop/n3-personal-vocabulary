@@ -1,5 +1,5 @@
 const PAGE_SIZE = 30;
-const STANDALONE_DATA_VERSION = "20260715-2";
+const STANDALONE_DATA_VERSION = "20260715-3";
 const storageKey = "n3-personal-state-v1";
 const defaultSettings = {
   speed: 0.7, sentenceLevel: "N3", autoPronounce: true, personFirst: true, chineseAuto: false,
@@ -32,6 +32,8 @@ let relatedLexicon = {};
 const standaloneScriptPromises = new Map();
 let detailDataPromise = null;
 let edgeChineseAudioPromise = null;
+let wordExtrasPromise = null;
+let wordExtrasHydrated = false;
 let currentView = "home";
 let currentPage = 1;
 let studyIndex = 0;
@@ -158,6 +160,29 @@ function ensureEdgeChineseAudio() {
   return edgeChineseAudioPromise;
 }
 
+function ensureWordExtras() {
+  if (wordExtrasHydrated) return Promise.resolve();
+  if (!window.__STANDALONE__ || words.some(word => word.chinese || word.japanese)) {
+    wordExtrasHydrated = true;
+    return Promise.resolve();
+  }
+  if (!wordExtrasPromise) {
+    wordExtrasPromise = loadStandaloneScript("word-extras.js", "__WORD_EXTRAS__").then(extras => {
+      words.forEach(word => {
+        const [chinese = "", japanese = ""] = extras[word.id] || [];
+        word.chinese = chinese;
+        word.japanese = japanese;
+      });
+      wordExtrasHydrated = true;
+      window.__WORD_EXTRAS__ = null;
+    }).catch(error => {
+      wordExtrasPromise = null;
+      throw error;
+    });
+  }
+  return wordExtrasPromise;
+}
+
 function loadState() {
   try {
     return {
@@ -279,8 +304,11 @@ function setMotionImage(image, source) {
   if (resolved && image.getAttribute("src") !== resolved) image.src = resolved;
 }
 
-function hydrateStandaloneAssets(root = document) {
-  root.querySelectorAll?.("[data-smw-src]").forEach(image => setMotionImage(image, image.dataset.smwSrc));
+function hydrateStandaloneAssets(root = document, includeEaster = false) {
+  root.querySelectorAll?.("[data-smw-src]").forEach(image => {
+    if (!includeEaster && image.closest(".easter-level")) return;
+    setMotionImage(image, image.dataset.smwSrc);
+  });
 }
 
 hydrateStandaloneAssets();
@@ -291,6 +319,12 @@ function stopMascotFrames() {
 }
 
 function scheduleMotionWarmup() {
+  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  const limitedDevice = window.matchMedia("(max-width: 900px)").matches
+    || (navigator.deviceMemory && navigator.deviceMemory <= 4)
+    || connection?.saveData
+    || /(?:^|-)2g$/.test(connection?.effectiveType || "");
+  if (limitedDevice) return;
   const warm = () => {
     new Set(Object.values(petAssetPaths)).forEach(source => {
       if (motionAssetCache.has(source)) return;
@@ -305,8 +339,8 @@ function scheduleMotionWarmup() {
       image.decode?.().catch(() => {});
     });
   };
-  if ("requestIdleCallback" in window) window.requestIdleCallback(warm, { timeout: 1800 });
-  else setTimeout(warm, 240);
+  if ("requestIdleCallback" in window) window.requestIdleCallback(warm, { timeout: 5000 });
+  else setTimeout(warm, 3000);
 }
 
 function notePetInteraction() {
@@ -1413,6 +1447,13 @@ function studyWords() {
 }
 
 function renderLearn() {
+  if (window.__STANDALONE__ && !wordExtrasHydrated) {
+    app.innerHTML = '<div class="loading">正在准备学习释义...</div>';
+    ensureWordExtras()
+      .then(() => { if (currentView === "learn") renderLearn(); })
+      .catch(error => { if (currentView === "learn") app.innerHTML = `<div class="empty error">${escapeHtml(error.message)}</div>`; });
+    return;
+  }
   const list = studyWords();
   studyIndex %= list.length;
   const w = list[studyIndex];
@@ -1655,13 +1696,14 @@ function openSpellTool(word, data) {
   closeWordTool();
   document.body.classList.add("word-tool-open");
   const answers = [...new Set([...(data.correct_spell || []), word.jp_word, word.hiragana].filter(Boolean))];
+  const japaneseClue = word.japanese || data.base?.japanese || "";
   document.body.insertAdjacentHTML("beforeend", `<div class="word-tool-overlay spell-tool">
     <button class="word-tool-close" data-tool-close aria-label="返回">‹ 返回</button>
     <div class="spell-card">
       <img class="tool-mario" src="${escapeHtml(assetUrl("/assets/smw/jump.png"))}" alt="" />
       <h2>随手拼</h2>
       <p class="tool-muted">${escapeHtml(word.cixing || "")}</p>
-      <div class="spell-clue"><b>${escapeHtml(word.zh_word || "")}</b><small>日文　${escapeHtml(word.japanese || "")}</small></div>
+      <div class="spell-clue"><b>${escapeHtml(word.zh_word || "")}</b><small>日文　${escapeHtml(japaneseClue)}</small></div>
       <input id="spell-input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="请输入日文" />
       <div class="spell-feedback" aria-live="polite"></div>
       <div class="spell-actions"><button class="ghost" data-spell-audio>播放发音</button><button class="ghost" data-spell-answer>显示答案</button><button class="primary" data-spell-check>确认</button></div>
@@ -1848,6 +1890,7 @@ async function showDetail(word, options = {}) {
     if (requestToken !== detailRequestToken || openDetailWordId !== word.id) return;
     sentenceLevelCache.set(word.id, levelSentences);
     const displayData = selectSentenceDetail(data, levelSentences);
+    const displayBase = displayData.base || {};
     currentDetailData = displayData;
     const sentence = Array.isArray(displayData.sentence) ? displayData.sentence : displayData.sentence?.jp ? [displayData.sentence] : [];
     const grammar = displayData.grammar || [];
@@ -1859,7 +1902,7 @@ async function showDetail(word, options = {}) {
     detailContent.innerHTML = `
       <div class="detail-summary">
         <div class="detail-head">${options.autoFollow ? `<span class="auto-follow-badge">自动朗读 · ${autoReadWords.findIndex(item => item.id === word.id) + 1}/${autoReadWords.length}</span>` : ""}<h2>${escapeHtml(word.jp_word)} <span class="pitch">${escapeHtml(word.yindiao)}</span></h2><p>${escapeHtml(word.hiragana)} · ${escapeHtml(word.cixing)}</p>${state.settings.showRomaji ? `<small class="romaji">${escapeHtml(romaji(word.hiragana))}</small>` : ""}</div>
-        <div class="detail-meaning"><b>${escapeHtml(word.zh_word)}</b><small>${escapeHtml(word.chinese || "")}</small></div>
+        <div class="detail-meaning"><b>${escapeHtml(word.zh_word)}</b><small>${escapeHtml(word.chinese || displayBase.chinese || "")}</small></div>
       </div>
       <div class="study-actions">
         <button class="ghost" data-dialog-audio="jp">日语发音</button>
@@ -2343,6 +2386,7 @@ let easterOffscreenTimer = null;
 let easterRecoveryTimer = null;
 let easterLevelInViewport = false;
 let easterViewportFrame = null;
+let easterAssetsHydrated = false;
 
 function stopEasterTimeline() {
   if (easterTimelineFrame !== null) cancelAnimationFrame(easterTimelineFrame);
@@ -2458,8 +2502,14 @@ function syncEasterOffscreenRecovery(inViewport = easterLevelIntersectsViewport(
     recoverPetFromOffscreenCourse();
   }, 1000);
 }
+function hydrateEasterAssets() {
+  if (easterAssetsHydrated || !easterLevel) return;
+  easterAssetsHydrated = true;
+  hydrateStandaloneAssets(easterLevel, true);
+}
 function playEasterLevel() {
   if (!easterLevel || easterCourseRunning || reducedMotionQuery.matches || state.settings.motionLevel === "off" || marioPet.classList.contains("pet-course-recovering") || !mascotAwake || !state.settings.petEnabled || state.settings.petNeverWake) return;
+  hydrateEasterAssets();
   clearTimeout(easterRecoveryTimer);
   marioPet.classList.remove("pet-course-recovering");
   easterCourseRunning = true;
@@ -2486,6 +2536,7 @@ new IntersectionObserver(entries => {
   if (!entry) return;
   syncEasterOffscreenRecovery(entry.isIntersecting);
   if (entry.isIntersecting) {
+    hydrateEasterAssets();
     if (entry.intersectionRatio > .5) playEasterLevel();
   }
 }, { threshold: [0, .5] }).observe(easterLevel);
