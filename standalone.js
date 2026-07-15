@@ -1,0 +1,1 @@
+window.__STANDALONE__=true;

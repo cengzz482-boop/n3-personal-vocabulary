@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: n3-personal-vocabulary
+    runtime: static
+    plan: free
+    buildCommand: echo "Static site ready"
+    staticPublishPath: .
+    headers:
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
