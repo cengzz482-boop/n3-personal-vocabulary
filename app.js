@@ -1,5 +1,5 @@
 const PAGE_SIZE = 30;
-const STANDALONE_DATA_VERSION = "20260715-4";
+const STANDALONE_DATA_VERSION = "20260716-1";
 const DETAIL_CHUNK_COUNT = 64;
 const storageKey = "n3-personal-state-v1";
 const defaultSettings = {
